@@ -1,0 +1,87 @@
+# Copy to ~/.config/tricky-mesh-ai-api/config.yaml and edit.
+
+# --- Required ---------------------------------------------------------------
+
+# Hostname or IP of the MeshCore companion radio on the LAN.
+meshcore_host: 192.168.40.69
+# WiFi companion firmware default. Change if your firmware is configured
+# with a non-standard port.
+meshcore_port: 5000
+
+llama_endpoint: http://localhost:8090
+
+# 12-char hex public-key prefixes of senders allowed to DM the bot. You can
+# find a contact's prefix in the MeshCore app / CLI, or log an incoming DM
+# once and read it from the daemon's INFO log.
+# Empty list = accept any sender (MeshCore DMs are end-to-end encrypted, but
+# this still lets anyone reachable spam you — only safe in closed networks).
+allowed_pubkey_prefixes:
+  - "a1b2c3d4e5f6"
+
+# --- LLM --------------------------------------------------------------------
+
+# Optional — llama.cpp serves whatever is loaded; usually leave unset.
+# model: some-model-name
+
+# system_prompt may contain {model} — substituted at startup with the name
+# reported by the llama.cpp /v1/models endpoint (or `model` above if set).
+# system_prompt: |
+#   You are {model}, answering a direct LoRa DM.
+#   Keep replies very short (well under 140 bytes). One or two sentences.
+
+# Hard cap on reply size, measured in UTF-8 bytes (the over-the-wire unit).
+# MeshCore protocol cites ~133 char channel messages; 140 is a safe DM default.
+max_reply_bytes: 140
+# Sanity cap on inbound DM text — don't forward pathologically large content
+# to the LLM. Oversized messages are dead-lettered and counted.
+max_inbound_bytes: 500
+llm_timeout_seconds: 60
+# Unbounded by default: reasoning models need headroom for internal thinking.
+# llm_max_tokens: 800
+
+# --- ACK / traceroute -------------------------------------------------------
+
+# After sending a reply we wait for an ACK event matching the expected code.
+# Timeout here counts as delivery failure and (if enabled) triggers diagnostics.
+ack_wait_timeout_seconds: 30
+
+# On ACK failure, fire send_path_discovery (asks the radio to find a fresh
+# path to the destination) and send_trace (records per-hop SNR/RSSI along
+# the new path). Per-destination cooldown prevents storming the mesh on
+# cascading failures.
+traceroute_on_failure: true
+traceroute_cooldown_seconds: 60
+
+# --- Operational ------------------------------------------------------------
+
+# Per-sender cooldown in seconds. 0 disables.
+rate_limit_per_sender_seconds: 30
+
+# JSONL log of dropped/failed messages. Unset to disable.
+dead_letter_log_path: ~/.local/state/tricky-mesh-ai-api/dead-letter.jsonl
+
+# --- Conversation memory ---------------------------------------------------
+
+# Per-sender bounded history (user + assistant entries counted together).
+# 0 = stateless (each DM is an independent prompt).
+conversation_memory_turns: 100
+conversation_ttl_seconds: 86400  # 24h
+
+# Rolling summary: once the verbatim window exceeds `trigger_turns`, the
+# oldest (current_len - keep_turns) turns are evicted to a background
+# summarizer that folds them into a running summary.
+conversation_summary_enabled: true
+conversation_summary_trigger_turns: 60
+conversation_summary_keep_turns: 40
+conversation_summary_max_chars: 800
+
+# --- Metrics (optional) ----------------------------------------------------
+
+metrics_http_enabled: false
+metrics_http_host: 127.0.0.1
+metrics_http_port: 9108
+
+# --- Reconnect -------------------------------------------------------------
+
+reconnect_initial_backoff: 2
+reconnect_max_backoff: 60

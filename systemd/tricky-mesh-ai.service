@@ -1,0 +1,32 @@
+[Unit]
+Description=Tricky Mesh AI bridge (MeshCore DM -> llama.cpp)
+Documentation=file:%h/projects/personal/tricky-mesh-ai-api/plan.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/projects/personal/tricky-mesh-ai-api/.venv/bin/tricky-mesh-ai
+Restart=on-failure
+RestartSec=5
+# Don't restart if the daemon exits because of a config error (exit 2).
+RestartPreventExitStatus=2
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tricky-mesh-ai
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/tricky-mesh-ai-api
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=default.target

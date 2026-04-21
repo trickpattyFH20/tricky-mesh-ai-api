@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local config (may contain allowlist prefixes, dead-letter paths, etc.)
+config.yaml
+*.local.yaml
+
+# Runtime state
+dead-letter.jsonl
+*.log
