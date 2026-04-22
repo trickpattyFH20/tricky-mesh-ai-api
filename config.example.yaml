@@ -2,11 +2,11 @@
 
 # --- Required ---------------------------------------------------------------
 
-# Hostname or IP of the MeshCore companion radio on the LAN.
-meshcore_host: 192.168.40.69
-# WiFi companion firmware default. Change if your firmware is configured
-# with a non-standard port.
-meshcore_port: 5000
+# Base URL of the Remote-Terminal-for-MeshCore instance that will:
+#   (1) webhook-POST inbound DMs to us (see webhook fanout config in RT)
+#   (2) accept our reply POSTs at /api/messages/direct
+# RT owns the radio; this daemon speaks HTTP only.
+rt_base_url: http://127.0.0.1:8000
 
 llama_endpoint: http://localhost:8090
 
@@ -17,6 +17,26 @@ llama_endpoint: http://localhost:8090
 # this still lets anyone reachable spam you — only safe in closed networks).
 allowed_pubkey_prefixes:
   - "a1b2c3d4e5f6"
+
+# --- HTTP server ------------------------------------------------------------
+
+# Where we listen for /ingest-dm POSTs from Remote-Terminal's webhook fanout.
+listen_host: 127.0.0.1
+listen_port: 8090
+
+# Shared-secret HMAC verification of incoming webhooks. Must match RT's
+# webhook fanout config's `hmac_secret`. Leave empty to disable (not
+# recommended — anything on the network could forge inbound DMs).
+ingest_hmac_secret: ""
+
+# Optional HTTP Basic auth forwarded to RT when we POST replies. Only
+# needed if RT is launched with MESHCORE_BASIC_AUTH_USERNAME/PASSWORD.
+rt_basic_auth_username: ""
+rt_basic_auth_password: ""
+
+# Timeout for the POST to RT's /api/messages/direct. RT blocks on the
+# radio lock while sending, so 30s is a safe default.
+rt_reply_timeout_seconds: 30
 
 # --- LLM --------------------------------------------------------------------
 
@@ -38,19 +58,6 @@ max_inbound_bytes: 500
 llm_timeout_seconds: 60
 # Unbounded by default: reasoning models need headroom for internal thinking.
 # llm_max_tokens: 800
-
-# --- ACK / traceroute -------------------------------------------------------
-
-# After sending a reply we wait for an ACK event matching the expected code.
-# Timeout here counts as delivery failure and (if enabled) triggers diagnostics.
-ack_wait_timeout_seconds: 30
-
-# On ACK failure, fire send_path_discovery (asks the radio to find a fresh
-# path to the destination) and send_trace (records per-hop SNR/RSSI along
-# the new path). Per-destination cooldown prevents storming the mesh on
-# cascading failures.
-traceroute_on_failure: true
-traceroute_cooldown_seconds: 60
 
 # --- Operational ------------------------------------------------------------
 
@@ -80,8 +87,3 @@ conversation_summary_max_chars: 800
 metrics_http_enabled: false
 metrics_http_host: 127.0.0.1
 metrics_http_port: 9108
-
-# --- Reconnect -------------------------------------------------------------
-
-reconnect_initial_backoff: 2
-reconnect_max_backoff: 60

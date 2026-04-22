@@ -1,3 +1,24 @@
+"""Daemon: LLM-backed auto-reply for DMs delivered over HTTP from
+Remote-Terminal-for-MeshCore.
+
+This module used to hold a direct TCP connection to a MeshCore companion
+radio and TX replies via ``mc.commands.send_msg``. That architecture
+conflicted with Remote-Terminal also owning the radio (single TCP client
+limit on the companion firmware's SerialWifiInterface) and prevented the
+daemon from seeing DMs that arrive via MQTT downlink (those never touch
+the physical radio). The current design:
+
+- Remote-Terminal's webhook fanout POSTs inbound decoded DMs to this
+  daemon's FastAPI ``/ingest-dm`` endpoint (see ``http_server.py``).
+- The HTTP handler calls ``Daemon.handle_inbound_dm(payload)`` with a
+  minimal event-shape dict (``text``, ``pubkey_prefix``, ``path_len``,
+  ``timestamp``).
+- After the LLM generates a reply, we POST it back to RT's
+  ``/api/messages/direct`` route; RT owns the radio and publishes to
+  MQTT, so the reply reaches both local-RF neighbors and out-of-range
+  recipients that downlink via community brokers.
+"""
+
 import asyncio
 import logging
 import signal
@@ -5,7 +26,7 @@ import time
 from http.server import ThreadingHTTPServer
 from typing import Any
 
-from meshcore import MeshCore, EventType
+import httpx
 
 from .config import Config
 from .deadletter import DeadLetterLog
@@ -51,17 +72,13 @@ class Daemon:
         self.metrics = Metrics()
         self._metrics_server: ThreadingHTTPServer | None = None
         self._stop = asyncio.Event()
-        self._disconnected = asyncio.Event()
-        self._mc: MeshCore | None = None
-        self._own_prefix: str | None = None
         self._tasks: set[asyncio.Task] = set()
-        self._contact_lock = asyncio.Lock()
-        self._last_traceroute: dict[str, float] = {}
-        self._traceroute_lock = asyncio.Lock()
+        self._rt_client: httpx.AsyncClient | None = None
 
-    # --- public entry ------------------------------------------------------
+    # ── Lifecycle ────────────────────────────────────────────────────────
 
-    async def run(self) -> None:
+    async def startup(self) -> None:
+        """Create long-lived resources (httpx client, metrics server)."""
         self._install_signal_handlers()
         if self.config.metrics_http_enabled:
             self._metrics_server = start_metrics_server(
@@ -69,137 +86,76 @@ class Daemon:
                 self.config.metrics_http_host,
                 self.config.metrics_http_port,
             )
-
-        backoff = self.config.reconnect_initial_backoff
-        first = True
-        try:
-            while not self._stop.is_set():
-                try:
-                    if not first:
-                        self.metrics.inc("meshcore_reconnects_total")
-                    first = False
-                    await self._connect_and_serve()
-                    backoff = self.config.reconnect_initial_backoff
-                except Exception as e:
-                    log.error("meshcore connection error: %s", e, exc_info=True)
-                finally:
-                    await self._teardown_iface()
-
-                if self._stop.is_set():
-                    break
-                log.info("reconnecting in %.1fs", backoff)
-                try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=backoff)
-                    break  # stop signaled during backoff
-                except asyncio.TimeoutError:
-                    pass
-                backoff = min(backoff * 2, self.config.reconnect_max_backoff)
-        finally:
-            await self._drain_tasks()
-            await self.llm.aclose()
-            self.llm.close()
-            if hasattr(self.summarizer, "stop"):
-                self.summarizer.stop()
-            if self._metrics_server is not None:
-                self._metrics_server.shutdown()
-                self._metrics_server.server_close()
-            log.info("daemon stopped")
-
-    # --- connection lifecycle ---------------------------------------------
-
-    async def _connect_and_serve(self) -> None:
-        log.info(
-            "connecting to meshcore at %s:%d",
-            self.config.meshcore_host,
-            self.config.meshcore_port,
-        )
-        self._disconnected.clear()
-        self._mc = await MeshCore.create_tcp(
-            self.config.meshcore_host, self.config.meshcore_port
-        )
-        if self._mc is None:
-            raise RuntimeError("meshcore node did not respond to connection handshake")
-
-        await self._mc.ensure_contacts()
-        self._own_prefix = self._resolve_own_prefix()
-
-        self._mc.subscribe(EventType.CONTACT_MSG_RECV, self._on_msg)
-        self._mc.subscribe(EventType.DISCONNECTED, self._on_disconnect)
-        await self._mc.start_auto_message_fetching()
-
-        auth_desc = (
-            f"allowlist={sorted(self.allowed)}" if self.allowed else "any sender"
-        )
-        log.info("connected; listening for DMs (%s)", auth_desc)
-
-        # Block until shutdown OR the meshcore library reports the link dropped.
-        stop_task = asyncio.create_task(self._stop.wait())
-        disc_task = asyncio.create_task(self._disconnected.wait())
-        try:
-            await asyncio.wait(
-                {stop_task, disc_task}, return_when=asyncio.FIRST_COMPLETED
+        auth = None
+        if self.config.rt_basic_auth_username and self.config.rt_basic_auth_password:
+            auth = httpx.BasicAuth(
+                self.config.rt_basic_auth_username,
+                self.config.rt_basic_auth_password,
             )
-        finally:
-            stop_task.cancel()
-            disc_task.cancel()
+        self._rt_client = httpx.AsyncClient(
+            base_url=self.config.rt_base_url.rstrip("/"),
+            timeout=self.config.rt_reply_timeout_seconds,
+            auth=auth,
+        )
+        auth_desc = f"allowlist={sorted(self.allowed)}" if self.allowed else "any sender"
+        log.info(
+            "daemon ready; RT=%s, %s",
+            self.config.rt_base_url,
+            auth_desc,
+        )
 
-        if self._disconnected.is_set():
-            log.warning("meshcore connection lost; triggering reconnect")
+    async def shutdown(self) -> None:
+        """Drain pending tasks and close long-lived resources."""
+        await self._drain_tasks()
+        if self._rt_client is not None:
+            await self._rt_client.aclose()
+            self._rt_client = None
+        await self.llm.aclose()
+        self.llm.close()
+        if hasattr(self.summarizer, "stop"):
+            self.summarizer.stop()
+        if self._metrics_server is not None:
+            self._metrics_server.shutdown()
+            self._metrics_server.server_close()
+        log.info("daemon stopped")
 
-    async def _teardown_iface(self) -> None:
-        mc, self._mc = self._mc, None
-        if mc is None:
-            return
-        try:
-            await mc.stop_auto_message_fetching()
-        except Exception:
-            pass
-        try:
-            await mc.disconnect()
-        except Exception:
-            log.exception("error disconnecting meshcore interface")
-
-    def _resolve_own_prefix(self) -> str | None:
-        """Extract our own 12-char pubkey prefix from meshcore.self_info so
-        we can drop any stray self-DMs."""
-        assert self._mc is not None
-        info = self._mc.self_info or {}
-        pk = info.get("public_key") or ""
-        if isinstance(pk, bytes):
-            pk = pk.hex()
-        pk = (pk or "").lower()
-        return pk[:12] if len(pk) >= 12 else None
-
-    def _on_disconnect(self, event) -> None:
-        # Subscribe callbacks are invoked as coroutines by meshcore — but this
-        # one is cheap and we want to be sync-safe. Define as plain function:
-        # meshcore's dispatcher will handle either shape.
-        self._disconnected.set()
-
-    # --- signal handling --------------------------------------------------
+    # ── Signal handling (best-effort; uvicorn usually owns signals) ─────
 
     def _install_signal_handlers(self) -> None:
-        loop = asyncio.get_running_loop()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
                 loop.add_signal_handler(sig, self._request_stop)
             except (NotImplementedError, RuntimeError):
-                # Non-unix fallback (tests on odd platforms)
                 signal.signal(sig, lambda *_: self._request_stop())
 
     def _request_stop(self) -> None:
         log.info("shutdown requested")
         self._stop.set()
 
-    # --- message handling -------------------------------------------------
+    # ── Inbound DM handling ─────────────────────────────────────────────
 
-    async def _on_msg(self, event) -> None:
-        # Thin dispatcher — long work spawns a task so it doesn't block
-        # other event delivery (notably ACK events we're awaiting).
-        t = asyncio.create_task(self._handle(event))
+    async def handle_inbound_dm(self, payload: dict[str, Any]) -> None:
+        """Public entry point called by the HTTP server for each ``/ingest-dm``
+        POST. Spawns a background task so the HTTP handler can return 202
+        quickly.
+        """
+        t = asyncio.create_task(self._handle_wrap(payload))
         self._tasks.add(t)
         t.add_done_callback(self._tasks.discard)
 
+    async def _handle_wrap(self, payload: dict[str, Any]) -> None:
+        try:
+            await self._handle(_SyntheticEvent(payload))
+        except Exception:
+            log.exception("error handling inbound DM")
+
+    # NOTE: _handle and _handle_inner keep the SyntheticEvent indirection so
+    # existing unit tests (tests/test_daemon.py) that feed MagicMock-style
+    # events keep working unchanged.
     async def _handle(self, event) -> None:
         try:
             await self._handle_inner(event)
@@ -213,16 +169,15 @@ class Daemon:
         if not prefix or not text:
             return
 
-        # Self-DM guard.
-        if self._own_prefix and prefix == self._own_prefix:
-            return
-
         self.metrics.inc("messages_received_total")
 
         if len(text.encode("utf-8")) > self.config.max_inbound_bytes:
             self.metrics.inc("messages_dropped_inbound_too_large_total")
             self.deadletter.record(
-                "inbound_too_large", prefix, text[:200], {"bytes": len(text.encode("utf-8"))}
+                "inbound_too_large",
+                prefix,
+                text[:200],
+                {"bytes": len(text.encode("utf-8"))},
             )
             log.info("dropped oversized DM from %s (%d bytes)", prefix, len(text.encode("utf-8")))
             return
@@ -233,35 +188,32 @@ class Daemon:
             log.info("dropped DM from non-allowlisted sender %s", prefix)
             return
 
-        contact = await self._resolve_contact(prefix)
-        if contact is None:
-            self.metrics.inc("messages_dropped_unknown_sender_total")
-            self.deadletter.record("unknown_sender", prefix, text, {})
-            log.info("dropped DM from unknown sender %s (not in radio contacts)", prefix)
-            return
-
-        # Rate-limit by full public key — stable + unforgeable.
-        contact_key = (contact.get("public_key") or prefix).lower()
-        allowed_rl, retry_after = self.ratelimit.allow(contact_key)
+        # Rate-limit by the full sender pubkey if we have it, else by prefix.
+        # RT's webhook body includes the full sender_key for PRIV messages;
+        # fall back to prefix if the caller only supplied a short id.
+        rate_key = (payload.get("sender_key") or prefix).lower()
+        allowed_rl, retry_after = self.ratelimit.allow(rate_key)
         if not allowed_rl:
             self.metrics.inc("messages_dropped_ratelimit_total")
             self.deadletter.record(
-                "rate_limited", prefix, text, {"retry_after_s": retry_after}
+                "rate_limited",
+                prefix,
+                text,
+                {"retry_after_s": retry_after},
             )
             log.info("rate-limited DM from %s (retry in %.1fs)", prefix, retry_after)
             return
 
         path_len = payload.get("path_len")
         log.info(
-            "DM from %s (%s) path_len=%s: %r",
+            "DM from %s path_len=%s: %r",
             prefix,
-            contact.get("adv_name") or "?",
             path_len if path_len is not None else "?",
             text,
         )
 
-        history = [(t.role, t.content) for t in self.memory.get(contact_key)]
-        summary = self.summarizer.get(contact_key)
+        history = [(t.role, t.content) for t in self.memory.get(rate_key)]
+        summary = self.summarizer.get(rate_key)
         extra_system = None
         if summary:
             extra_system = f"PRIOR CONVERSATION SUMMARY:\n{summary}"
@@ -285,102 +237,77 @@ class Daemon:
 
         log.info("reply to %s (%d bytes): %r", prefix, len(reply.encode("utf-8")), reply)
 
-        assert self._mc is not None
-        try:
-            sent = await self._mc.commands.send_msg(contact, reply)
-        except Exception as e:
-            self.metrics.inc("send_errors_total")
-            self.deadletter.record("send_error", prefix, reply, {"error": str(e)})
-            log.error("send_msg to %s failed: %s", prefix, e)
+        # Determine destination for the HTTP reply. We prefer the full
+        # sender_key from RT's webhook body; fall back to prefix.
+        destination = (payload.get("sender_key") or prefix).lower()
+        if not destination:
+            self.deadletter.record("no_destination", prefix, reply, {})
+            log.warning("no sender identity available; dropping reply to %s", prefix)
             return
 
-        # Update memory before spawning ACK-wait so history is consistent
-        # for a rapid follow-up from the same sender.
-        self.memory.append(contact_key, "user", text)
-        self.memory.append(contact_key, "assistant", reply)
+        ok = await self._send_reply_http(destination, reply)
+        if not ok:
+            return
+
+        # Update memory only on successful send.
+        self.memory.append(rate_key, "user", text)
+        self.memory.append(rate_key, "assistant", reply)
         self.metrics.inc("messages_replied_total")
 
-        expected_ack = None
-        if sent is not None and getattr(sent, "type", None) == EventType.MSG_SENT:
-            ack_bytes = (sent.payload or {}).get("expected_ack")
-            if ack_bytes:
-                expected_ack = ack_bytes.hex() if isinstance(ack_bytes, (bytes, bytearray)) else str(ack_bytes)
+    # ── Outbound reply via RT's REST API ────────────────────────────────
 
-        if expected_ack is not None:
-            t = asyncio.create_task(self._await_ack(contact, prefix, expected_ack))
-            self._tasks.add(t)
-            t.add_done_callback(self._tasks.discard)
-        else:
-            log.warning("send_msg to %s returned no expected_ack; skipping ACK tracking", prefix)
+    async def _send_reply_http(self, destination: str, text: str) -> bool:
+        """POST a DM reply to Remote-Terminal's /api/messages/direct endpoint.
 
-    async def _resolve_contact(self, prefix: str) -> dict | None:
-        assert self._mc is not None
-        contact = self._mc.get_contact_by_key_prefix(prefix)
-        if contact is not None:
-            return contact
-        # Miss — refresh the address book once, then retry. Serialized so a
-        # burst of DMs from a new sender doesn't storm ensure_contacts.
-        async with self._contact_lock:
-            contact = self._mc.get_contact_by_key_prefix(prefix)
-            if contact is not None:
-                return contact
-            try:
-                await self._mc.ensure_contacts(follow=True)
-            except Exception as e:
-                log.warning("ensure_contacts failed: %s", e)
-                return None
-            return self._mc.get_contact_by_key_prefix(prefix)
-
-    async def _await_ack(self, contact: dict, prefix: str, expected_ack: str) -> None:
-        assert self._mc is not None
+        Returns True on HTTP 2xx, False otherwise (metrics + dead-letter
+        captured for the failure case).
+        """
+        if self._rt_client is None:
+            log.error("httpx client not initialized; call startup() first")
+            return False
         try:
-            result = await self._mc.wait_for_event(
-                EventType.ACK,
-                attribute_filters={"code": expected_ack},
-                timeout=self.config.ack_wait_timeout_seconds,
+            resp = await self._rt_client.post(
+                "/api/messages/direct",
+                json={"destination": destination, "text": text},
             )
         except Exception as e:
-            log.warning("error waiting for ACK from %s: %s", prefix, e)
-            return
+            self.metrics.inc("send_errors_total")
+            self.deadletter.record("send_error", destination, text, {"error": str(e)})
+            log.error("POST /api/messages/direct to RT failed for %s: %s", destination, e)
+            return False
+        if resp.status_code >= 400:
+            self.metrics.inc("send_errors_total")
+            self.deadletter.record(
+                "send_error",
+                destination,
+                text,
+                {"status": resp.status_code, "body": resp.text[:500]},
+            )
+            log.error(
+                "RT rejected reply to %s: HTTP %d %s",
+                destination,
+                resp.status_code,
+                resp.text[:200],
+            )
+            return False
+        return True
 
-        if result is not None:
-            self.metrics.inc("reply_acks_success_total")
-            log.info("reply to %s ACKed", prefix)
-            return
-
-        self.metrics.inc("reply_acks_failed_total")
-        log.warning("reply to %s not ACKed within %.1fs", prefix, self.config.ack_wait_timeout_seconds)
-        self.deadletter.record("ack_failed", prefix, "", {"expected_ack": expected_ack})
-        await self._maybe_trigger_traceroute(contact, prefix)
-
-    async def _maybe_trigger_traceroute(self, contact: dict, prefix: str) -> None:
-        if not self.config.traceroute_on_failure:
-            return
-        mc = self._mc
-        if mc is None:
-            return
-        key = (contact.get("public_key") or prefix).lower()
-        now = time.monotonic()
-        async with self._traceroute_lock:
-            last = self._last_traceroute.get(key, 0.0)
-            if now - last < self.config.traceroute_cooldown_seconds:
-                return
-            self._last_traceroute[key] = now
-
-        try:
-            await mc.commands.send_path_discovery(contact)
-            log.info("path discovery sent to %s", prefix)
-        except Exception:
-            log.exception("send_path_discovery to %s failed", prefix)
-            return
-        try:
-            await mc.commands.send_trace()
-            log.info("trace sent after path discovery to %s", prefix)
-        except Exception:
-            log.exception("send_trace after path discovery to %s failed", prefix)
+    # ── Internals ───────────────────────────────────────────────────────
 
     async def _drain_tasks(self) -> None:
         if not self._tasks:
             return
         log.info("draining %d pending tasks", len(self._tasks))
         await asyncio.gather(*self._tasks, return_exceptions=True)
+
+
+class _SyntheticEvent:
+    """Tiny adapter so _handle_inner keeps its original ``event.payload``
+    access pattern regardless of whether the caller is the HTTP server
+    (dict payload) or legacy tests (MagicMock with ``payload`` attribute).
+    """
+
+    __slots__ = ("payload",)
+
+    def __init__(self, payload: dict[str, Any]):
+        self.payload = payload

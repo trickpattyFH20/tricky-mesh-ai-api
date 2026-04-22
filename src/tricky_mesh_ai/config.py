@@ -37,11 +37,27 @@ def _normalize_prefix(raw: str) -> str:
 @dataclass
 class Config:
     # Required
-    meshcore_host: str
     llama_endpoint: str
+    # URL of the Remote-Terminal-for-MeshCore instance that will deliver
+    # inbound DMs (webhook POSTs to us) and receive our outbound replies
+    # (we POST to /api/messages/direct there). RT owns the radio; this
+    # daemon no longer holds a TCP connection to meshcore itself.
+    rt_base_url: str
 
-    # Meshcore connection
-    meshcore_port: int = 5000
+    # HTTP server: where RT's webhook fanout should POST inbound DMs.
+    listen_host: str = "127.0.0.1"
+    listen_port: int = 8090
+
+    # HMAC secret shared with RT's webhook fanout config. Empty = skip
+    # verification (discouraged). When set, the X-Webhook-Signature
+    # header (sha256=<hex> of the JSON body) is required and validated.
+    ingest_hmac_secret: str = ""
+
+    # Optional HTTP Basic auth forwarded to RT when posting replies.
+    # Only needed if RT is launched with MESHCORE_BASIC_AUTH_USERNAME /
+    # MESHCORE_BASIC_AUTH_PASSWORD set. Leave empty otherwise.
+    rt_basic_auth_username: str = ""
+    rt_basic_auth_password: str = ""
 
     # Allowlist of 12-char hex pubkey prefixes permitted to DM the bot.
     # Empty list = accept any sender (MeshCore DMs are always end-to-end
@@ -60,16 +76,8 @@ class Config:
     # Cap on completion tokens. None = unbounded (let reasoning models think).
     llm_max_tokens: int | None = None
 
-    # ACK tracking — after send_msg, we wait for an ACK event matching the
-    # returned expected_ack code. On timeout, counts as delivery failure and
-    # (optionally) triggers path-discovery + trace diagnostics.
-    ack_wait_timeout_seconds: float = 30.0
-
-    # When True, on ACK timeout fire send_path_discovery (asks the radio to
-    # find a fresh path to the destination) and send_trace (records per-hop
-    # SNR along the new path). Rate-limited per-destination.
-    traceroute_on_failure: bool = True
-    traceroute_cooldown_seconds: float = 60.0
+    # Timeout for the HTTP POST to RT when sending a reply.
+    rt_reply_timeout_seconds: float = 30.0
 
     # Operational
     rate_limit_per_sender_seconds: float = 0.0  # 0 disables
@@ -90,17 +98,13 @@ class Config:
     metrics_http_host: str = "127.0.0.1"
     metrics_http_port: int = 9108
 
-    # Reconnect
-    reconnect_initial_backoff: float = 2.0
-    reconnect_max_backoff: float = 60.0
-
     @classmethod
     def load(cls, path: Path) -> "Config":
         data = yaml.safe_load(path.read_text()) or {}
         if not isinstance(data, dict):
             raise ValueError(f"config {path} must be a YAML mapping")
 
-        required = ("meshcore_host", "llama_endpoint")
+        required = ("rt_base_url", "llama_endpoint")
         missing = [k for k in required if k not in data]
         if missing:
             raise ValueError(f"config {path} missing required keys: {missing}")
