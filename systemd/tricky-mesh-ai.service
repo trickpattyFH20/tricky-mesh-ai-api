@@ -1,8 +1,17 @@
 [Unit]
-Description=Tricky Mesh AI bridge (MeshCore DM -> llama.cpp)
-Documentation=file:%h/projects/personal/tricky-mesh-ai-api/plan.md
-After=network-online.target
-Wants=network-online.target
+Description=Tricky Mesh AI bridge (Remote-Terminal webhook -> llama.cpp)
+# Start after network + llama.cpp model server. llama-server is Type=simple
+# and doesn't signal readiness, so we only get "start-after" semantics, not
+# "wait-until-ready" — during the ~30s Qwen 3.6-35B model load, early DMs
+# may fail their LLM call and land in the dead-letter log. Subsequent DMs
+# are fine once the model is up. Good enough for boot-time ordering without
+# extra machinery.
+#
+# RT (remoteterm.service) is system-scope and always starts before any
+# user-scope service via the multi-user.target → default.target chain, so
+# no explicit ordering needed for RT here.
+After=network-online.target llama-server.service
+Wants=network-online.target llama-server.service
 
 [Service]
 Type=simple
