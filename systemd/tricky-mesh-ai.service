@@ -15,11 +15,12 @@ Wants=network-online.target llama-server.service
 
 [Service]
 Type=simple
-ExecStart=%h/projects/personal/tricky-mesh-ai-api/.venv/bin/tricky-mesh-ai
+ExecStart=%h/projects/mesh/tricky-mesh-ai-api/.venv/bin/tricky-mesh-ai
 Restart=on-failure
 RestartSec=5
 # Don't restart if the daemon exits because of a config error (exit 2).
 RestartPreventExitStatus=2
+TimeoutStopSec=15
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=tricky-mesh-ai

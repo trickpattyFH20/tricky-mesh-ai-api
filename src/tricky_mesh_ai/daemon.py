@@ -21,7 +21,6 @@ the physical radio). The current design:
 
 import asyncio
 import logging
-import signal
 import time
 from http.server import ThreadingHTTPServer
 from typing import Any
@@ -71,7 +70,6 @@ class Daemon:
         self.deadletter = DeadLetterLog(config.dead_letter_path)
         self.metrics = Metrics()
         self._metrics_server: ThreadingHTTPServer | None = None
-        self._stop = asyncio.Event()
         self._tasks: set[asyncio.Task] = set()
         self._rt_client: httpx.AsyncClient | None = None
 
@@ -79,7 +77,6 @@ class Daemon:
 
     async def startup(self) -> None:
         """Create long-lived resources (httpx client, metrics server)."""
-        self._install_signal_handlers()
         if self.config.metrics_http_enabled:
             self._metrics_server = start_metrics_server(
                 self.metrics,
@@ -118,23 +115,6 @@ class Daemon:
             self._metrics_server.shutdown()
             self._metrics_server.server_close()
         log.info("daemon stopped")
-
-    # ── Signal handling (best-effort; uvicorn usually owns signals) ─────
-
-    def _install_signal_handlers(self) -> None:
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            try:
-                loop.add_signal_handler(sig, self._request_stop)
-            except (NotImplementedError, RuntimeError):
-                signal.signal(sig, lambda *_: self._request_stop())
-
-    def _request_stop(self) -> None:
-        log.info("shutdown requested")
-        self._stop.set()
 
     # ── Inbound DM handling ─────────────────────────────────────────────
 
